@@ -48,6 +48,21 @@ def render(verdicts, organized, proposals, corpus, clone, enrich_note: str | Non
          "| verdict | n |", "|---|---|"]
     for k in ("disagree", "surface_disagreement", "mention", "unprobeable", "agree"):
         L.append("| %s | %d |" % (k, counts.get(k, 0)))
+    verified = [v for v in verdicts if v["verdict"] == "agree"]
+    flagged = [v for v in verdicts if v["verdict"] in ("disagree", "surface_disagreement")]
+    L += ["", "BRANCHES  verified=%d (agree)  flagged=%d (disagree+surface_disagreement)"
+          % (len(verified), len(flagged))]
+    if verified:
+        v = verified[0]
+        L.append("  verified  %s:%d [%s] %s" % (
+            v["file"], v["line"], v["kind"], v.get("ref") or v.get("asserted") or ""))
+    if flagged:
+        v = flagged[0]
+        L.append("  flagged   %s:%d [%s] %s — %s says %s" % (
+            v["file"], v["line"], v["kind"], v.get("asserted") or v.get("ref") or "",
+            v.get("surface") or "?", v.get("observed") or ""))
+    if not verified or not flagged:
+        L.append("  BOTH-BRANCHES: MISSING — a single-branch run is #689's defect")
     L += ["", "MEMORY.md: %d bytes before, %d bytes after (budget 24985)" % (
         organized["index_bytes_before"], organized["index_bytes_after"])]
     if organized["trimmed"]:

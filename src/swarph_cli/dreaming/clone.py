@@ -3,7 +3,21 @@ from __future__ import annotations
 import hashlib, json, shutil, time
 from pathlib import Path
 
-def clone_corpus(mem: Path, out: Path) -> dict:
+def in_scheduled_slice(name: str) -> bool:
+    """The daily-timer input: live memories, not backups or the flattened dump.
+
+    A hand-picked file list is refused by the caller; this is the RULE that
+    selects the slice (#656 / #124).
+    """
+    n = name.lower()
+    if n.endswith(".bak") or ".bak-" in n or n.endswith(".bak.md"):
+        return False
+    if n == "memory_full.md":
+        return False
+    return n.endswith(".md")
+
+
+def clone_corpus(mem: Path, out: Path, slice: str = "all") -> dict:
     if out.exists() and any(out.iterdir()):
         # A dirty destination silently mixes two runs' proposals. GC2's hashes
         # would then stamp this run's manifest onto last run's files.
@@ -11,6 +25,8 @@ def clone_corpus(mem: Path, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     files = {}
     for p in sorted(mem.glob("*.md")):
+        if slice == "scheduled" and not in_scheduled_slice(p.name):
+            continue
         data = p.read_bytes()
         shutil.copy2(p, out / p.name)
         st = p.stat()

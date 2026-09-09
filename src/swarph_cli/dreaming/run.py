@@ -18,6 +18,11 @@ def main(argv=None) -> int:
         help="require enrich; refuse (rc=2) if SLM client is unavailable (#734)",
     )
     ap.add_argument("--verify-only", action="store_true")
+    ap.add_argument(
+        "--slice", choices=("all", "scheduled"), default="all",
+        help="all=every *.md (compat). scheduled=the timer input: live "
+             "memories only, no .bak* / MEMORY_FULL.md (card #656).",
+    )
     a = ap.parse_args(argv)
     if a.enrich and a.no_enrich:
         print("dreaming: refusing to run -- --enrich and --no-enrich conflict",
@@ -25,7 +30,7 @@ def main(argv=None) -> int:
         return 2
     corpus, out = Path(a.corpus), Path(a.out)
     try:
-        manifest = clone_corpus(corpus, out)
+        manifest = clone_corpus(corpus, out, slice=a.slice)
     except FileExistsError as e:
         print("dreaming: refusing to run -- %s" % e, file=sys.stderr)
         return 2

@@ -67,6 +67,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="require enrich; refuse (rc=2) if SLM client unavailable (#734)",
     )
     run.add_argument("--verify-only", action="store_true", help="verify only; skip organize/enrich")
+    run.add_argument(
+        "--slice", choices=("all", "scheduled"), default="all",
+        help="scheduled = rule-selected live memories (no backups / MEMORY_FULL). "
+             "That is the timer input — not a hand-picked file list (card #656).",
+    )
     return p
 
 
@@ -95,4 +100,6 @@ def run_dreaming(argv: list[str] | None = None) -> int:
         forwarded.append("--enrich")
     if args.verify_only:
         forwarded.append("--verify-only")
+    if getattr(args, "slice", "all") != "all":
+        forwarded.extend(["--slice", args.slice])
     return dreaming_run.main(forwarded)

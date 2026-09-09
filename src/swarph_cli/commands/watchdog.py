@@ -1926,10 +1926,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--reap", action="store_true",
         help="#666 T3: with --orphan-daemons, SIGTERM (then SIGKILL) each "
-             "ORPHANED daemon tree BY PID. Default OFF. Re-verifies "
-             "starttime+cmdline+scope immediately before each signal. "
-             "Never pkill -f. LIVE/UNKNOWN are never signalled. No timer "
-             "ships with this flag (T4 graduation).",
+             "daemon tree that matches ALL FOUR 09-03 clauses "
+             "(origin transient|fork, ppid=1, not a live pane, "
+             "childless or stale version). Default OFF. --origin-transient "
+             "alone is never enough. Re-verifies starttime+cmdline+scope "
+             "before each signal. Never pkill -f.",
+    )
+    p.add_argument(
+        "--can-fail", action="store_true",
+        help="#666/#123: with --orphan-daemons, run the healthy-pane "
+             "fixture (a transient daemon that IS a live tmux pane_pid) "
+             "and require it to be spared, printing which clause spared it. "
+             "Does not signal live processes.",
     )
     p.add_argument(
         "--install-service", action="store_true",
@@ -2109,6 +2117,9 @@ def run_watchdog(argv: Optional[list[str]] = None) -> int:
         return run_install_service(args)
 
     if args.orphan_daemons:
+        if getattr(args, "can_fail", False):
+            from swarph_cli.orphan_daemons import run_can_fail_healthy_pane
+            return run_can_fail_healthy_pane()
         from swarph_cli.orphan_daemons import run_orphan_daemons_report
         return run_orphan_daemons_report(reap=bool(args.reap))
 

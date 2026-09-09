@@ -268,6 +268,7 @@ def test_reap_reports_every_pid_and_never_touches_live(tmp_path):
     scope_dead = "tmux-spawn-dead.scope"
     orphan_cmd = (
         "/home/u/.local/bin/claude daemon run --origin transient "
+        "v2.1.200 "
         f"--spawned-by {json.dumps({'label': 'claude', 'pid': 700337})}"
     )
     live_cmd = (
@@ -294,9 +295,12 @@ def test_reap_reports_every_pid_and_never_touches_live(tmp_path):
 
     result = scan_orphan_daemons(
         proc_root=tmp_path, caller_pid=99999, run=fake_run,
+        installed_ver=(2, 1, 259),
     )
     assert {d.pid: d.state for d in result.daemons}[5000] == STATE_ORPHANED
     assert {d.pid: d.state for d in result.daemons}[6000] == STATE_LIVE
+    assert {d.pid: d.reapable for d in result.daemons}[5000] is True
+    assert {d.pid: d.reapable for d in result.daemons}[6000] is False
 
     killed = []
 
@@ -330,3 +334,99 @@ def test_watchdog_reap_requires_orphan_daemons():
     from swarph_cli.commands import watchdog
     rc = watchdog.run_watchdog(["--reap"])
     assert rc == 4
+
+
+def _tmux_one_pane(pane="42"):
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return SimpleNamespace(returncode=0, stdout="lab-ovh\n", stderr="")
+        if cmd[:2] == ["tmux", "list-panes"]:
+            return SimpleNamespace(returncode=0, stdout=f"{pane}\n", stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+    return fake_run
+
+
+def test_transient_only_is_not_reapable(tmp_path):
+    """#123 FAIL branch: --origin transient alone must not be enough to kill."""
+    cmd = (
+        "/home/u/.local/bin/claude daemon run --origin transient "
+        f"--spawned-by {json.dumps({'label': 'claude', 'pid': 700337})}"
+    )
+    _write_proc(tmp_path, 5000, cmdline=cmd, ppid=100)  # not init
+    result = scan_orphan_daemons(
+        proc_root=tmp_path, caller_pid=99999, run=_tmux_one_pane(),
+    )
+    d = result.daemons[0]
+    assert d.clauses["origin_or_fork"] is True
+    assert d.reapable is False
+    assert d.spared_by == "ppid_init"
+    killed = []
+    reports = reap_orphans(
+        result, proc_root=tmp_path,
+        kill=lambda pid, sig: killed.append((pid, sig)),
+        wait_s=0.01, poll_s=0.001, sleeper=lambda _s: None,
+    )
+    assert reports == [] and killed == []
+    assert "no four-clause match" in format_reap_report(reports)
+
+
+def test_healthy_pane_daemon_is_spared_and_names_clause(tmp_path):
+    """#123 can-fail: backing a live pane → spared, clause printed."""
+    cmd = (
+        "/home/u/.local/bin/claude daemon run --origin transient "
+        f"--spawned-by {json.dumps({'label': 'claude', 'pid': 700337})}"
+    )
+    _write_proc(tmp_path, 42, cmdline=cmd, ppid=1,
+                cgroup="0::/user.slice/tmux-spawn-alive.scope")
+    result = scan_orphan_daemons(
+        proc_root=tmp_path, caller_pid=99999, run=_tmux_one_pane("42"),
+    )
+    d = result.daemons[0]
+    assert d.reapable is False
+    assert d.spared_by == "not_live_pane"
+    text = format_report(result)
+    assert "spared-by=not_live_pane" in text
+    assert "REAPABLE" not in text
+
+
+def test_four_clauses_all_true_is_reapable(tmp_path):
+    cmd = (
+        "/home/u/.local/bin/claude daemon run --origin transient "
+        f"--spawned-by {json.dumps({'label': 'claude', 'pid': 700337})}"
+    )
+    _write_proc(tmp_path, 5000, cmdline=cmd, ppid=1,
+                cgroup="0::/user.slice/tmux-spawn-dead.scope")
+    result = scan_orphan_daemons(
+        proc_root=tmp_path, caller_pid=99999, run=_tmux_one_pane("42"),
+    )
+    d = result.daemons[0]
+    assert d.reapable is True
+    assert d.spared_by is None
+    assert all(d.clauses[k] for k in (
+        "origin_or_fork", "ppid_init", "not_live_pane", "childless_or_stale"))
+    assert "→ REAPABLE" in format_report(result)
+
+
+def test_still_running_with_fresh_heartbeat_is_still_reapable(tmp_path):
+    """lab-ovh 36742: 15-day orphan still writing drain_heartbeat.json one
+    minute before the kill. A reaper keyed on 'is it running' spares that
+    forever. Four-clause must not grow a liveness/heartbeat spare."""
+    cmd = (
+        "/home/u/.local/bin/claude daemon run --origin transient "
+        f"--spawned-by {json.dumps({'label': 'claude', 'pid': 700337})}"
+    )
+    _write_proc(tmp_path, 5000, cmdline=cmd, ppid=1,
+                cgroup="0::/user.slice/tmux-spawn-dead.scope")
+    (tmp_path / "5000" / "cwd").mkdir(exist_ok=True)
+    (tmp_path / "5000" / "cwd" / "drain_heartbeat.json").write_text(
+        '{"ts": "2026-09-09T21:23:00Z"}'
+    )
+    result = scan_orphan_daemons(
+        proc_root=tmp_path, caller_pid=99999, run=_tmux_one_pane("42"),
+    )
+    d = result.daemons[0]
+    assert d.reapable is True
+    assert "heartbeat" not in (d.spared_by or "")
+    assert "alive" not in (d.reason or "").lower() or d.reapable
+    assert "liveness" not in d.clauses
+

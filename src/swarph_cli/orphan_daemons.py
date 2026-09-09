@@ -5,8 +5,10 @@ LIVE / ORPHANED / UNKNOWN from ``--spawned-by`` + tmux-scope evidence.
 
 UNKNOWN must never be treated as ORPHANED
 ([[feedback_absent_feature_looks_like_broken_feature]]). T1 prints only.
-T3 ``--reap`` is opt-in, PID-only, re-verifies identity before each
-signal. Never ``pkill -f``.
+T3 ``--reap`` is opt-in, PID-only, and kills only the 09-03 four-clause
+matches (transient|fork AND ppid=1 AND not a live pane AND
+childless-or-stale). ``--origin transient`` alone is never enough.
+Re-verifies identity before each signal. Never ``pkill -f``.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import os
 import re
 import subprocess
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +37,19 @@ _ORIGIN_RE = re.compile(r"--origin\s+(\S+)")
 _TMUX_SCOPE_RE = re.compile(r"(tmux-spawn-[^/\s]+\.scope)")
 
 
+# 09-03 four-clause reap predicate (#123). ALL four must hold to kill.
+# An --origin-transient-only match is not enough (that would have killed
+# a working daemon on 2026-09-03).
+CLAUSE_ORIGIN = "origin_or_fork"
+CLAUSE_PPID = "ppid_init"
+CLAUSE_PANE = "not_live_pane"
+CLAUSE_STALE = "childless_or_stale"
+REAP_CLAUSES = (CLAUSE_ORIGIN, CLAUSE_PPID, CLAUSE_PANE, CLAUSE_STALE)
+
+_FORK_RE = re.compile(r"--fork-session\b")
+_VER_RE = re.compile(r"\bv?(\d+)\.(\d+)\.(\d+)\b")
+
+
 @dataclass
 class DaemonReport:
     pid: int
@@ -48,6 +64,12 @@ class DaemonReport:
     rss_kb: int = 0
     reason: str = ""
     self_excluded: bool = False
+    ppid: Optional[int] = None
+    sid: Optional[int] = None
+    version: Optional[str] = None
+    clauses: dict = field(default_factory=dict)
+    spared_by: Optional[str] = None
+    reapable: bool = False
 
 
 @dataclass
@@ -57,6 +79,11 @@ class ScanResult:
     @property
     def orphans(self) -> list[DaemonReport]:
         return [d for d in self.daemons if d.state == STATE_ORPHANED]
+
+    @property
+    def reapable(self) -> list[DaemonReport]:
+        """Four-clause matches only. T2 ORPHANED is not a kill list."""
+        return [d for d in self.daemons if d.reapable]
 
     @property
     def unknowns(self) -> list[DaemonReport]:
@@ -94,6 +121,93 @@ def parse_spawned_by(cmdline: str) -> Optional[dict]:
 def parse_origin(cmdline: str) -> Optional[str]:
     m = _ORIGIN_RE.search(cmdline)
     return m.group(1) if m else None
+
+
+def is_transient_or_fork(cmdline: str) -> bool:
+    """Clause 1: `--origin transient` OR `--fork-session`."""
+    return parse_origin(cmdline) == "transient" or bool(_FORK_RE.search(cmdline))
+
+
+def parse_version(text: Optional[str]) -> Optional[tuple[int, int, int]]:
+    if not text:
+        return None
+    m = _VER_RE.search(text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def version_string(triple: Optional[tuple[int, int, int]]) -> Optional[str]:
+    if not triple:
+        return None
+    return f"{triple[0]}.{triple[1]}.{triple[2]}"
+
+
+def read_sid(pid: int, *, proc_root: Path = Path("/proc")) -> Optional[int]:
+    """/proc/<pid>/stat session id (field 6)."""
+    after = _stat_after_comm(pid, proc_root=proc_root)
+    if after is None or len(after) < 4:
+        return None
+    try:
+        return int(after[3])
+    except ValueError:
+        return None
+
+
+def live_pane_pids(
+    sessions: Optional[Iterable[str]],
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> Optional[set[int]]:
+    """None if tmux is unreachable (cannot prove 'not a live pane')."""
+    if sessions is None:
+        return None
+    out: set[int] = set()
+    for session in sessions:
+        out.update(pane_pids_for_session(session, run=run))
+    return out
+
+
+def evaluate_reap_clauses(
+    *,
+    cmdline: str,
+    ppid: Optional[int],
+    pid: int,
+    sid: Optional[int],
+    pane_pids: Optional[set[int]],
+    child_count: int,
+    daemon_ver: Optional[tuple[int, int, int]],
+    installed_ver: Optional[tuple[int, int, int]],
+    self_related: bool = False,
+) -> tuple[dict, Optional[str], bool]:
+    """Return (clauses, spared_by, reapable).
+
+    All four clauses must be True. Incomplete pane evidence (tmux down)
+    fails clause 3 rather than failing open into a kill.
+    Self-related daemons are never reapable.
+    """
+    clauses = {
+        CLAUSE_ORIGIN: is_transient_or_fork(cmdline),
+        CLAUSE_PPID: ppid == 1,
+        CLAUSE_PANE: False,
+        CLAUSE_STALE: False,
+    }
+    if pane_pids is not None:
+        clauses[CLAUSE_PANE] = (
+            pid not in pane_pids
+            and (sid is None or sid not in pane_pids)
+        )
+    stale = (
+        daemon_ver is not None
+        and installed_ver is not None
+        and daemon_ver < installed_ver
+    )
+    clauses[CLAUSE_STALE] = (child_count == 0) or stale
+    if self_related:
+        return clauses, "self-exclusion", False
+    for name in REAP_CLAUSES:
+        if not clauses[name]:
+            return clauses, name, False
+    return clauses, None, True
 
 
 def extract_tmux_scope(cgroup_text: Optional[str]) -> Optional[str]:
@@ -350,6 +464,7 @@ def scan_orphan_daemons(
     proc_root: Path = Path("/proc"),
     caller_pid: Optional[int] = None,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    installed_ver: Optional[tuple[int, int, int]] = None,
 ) -> ScanResult:
     """Walk /proc, classify every ``claude daemon run``, return the report."""
     if caller_pid is None:
@@ -362,6 +477,7 @@ def scan_orphan_daemons(
         scopes = None
     else:
         scopes = live_scopes(sessions, proc_root=proc_root, run=run)
+    panes = live_pane_pids(sessions, run=run)
 
     result = ScanResult()
     for pid, cmdline in enumerate_claude_daemon_pids(proc_root=proc_root):
@@ -399,6 +515,20 @@ def scan_orphan_daemons(
         rss = read_rss_kb(pid, proc_root=proc_root) + sum(
             read_rss_kb(c, proc_root=proc_root) for c in tree
         )
+        ppid = read_ppid(pid, proc_root=proc_root)
+        sid = read_sid(pid, proc_root=proc_root)
+        daemon_ver = parse_version(cmdline)
+        clauses, spared_by, reapable = evaluate_reap_clauses(
+            cmdline=cmdline,
+            ppid=ppid,
+            pid=pid,
+            sid=sid,
+            pane_pids=panes,
+            child_count=len(tree),
+            daemon_ver=daemon_ver,
+            installed_ver=installed_ver,
+            self_related=related,
+        )
         result.daemons.append(
             DaemonReport(
                 pid=pid,
@@ -413,6 +543,12 @@ def scan_orphan_daemons(
                 rss_kb=rss,
                 reason=reason,
                 self_excluded=related,
+                ppid=ppid,
+                sid=sid,
+                version=version_string(daemon_ver),
+                clauses=clauses,
+                spared_by=spared_by,
+                reapable=reapable,
             )
         )
     return result
@@ -445,14 +581,24 @@ def format_report(result: ScanResult) -> str:
             "live" if d.scope_live else "dead" if d.scope_live is False else "?"
         )
         excl = " SELF-EXCLUDED" if d.self_excluded else ""
+        clause_bits = ",".join(
+            f"{k}={'T' if d.clauses.get(k) else 'F'}" for k in REAP_CLAUSES
+        )
+        reap_bit = "REAPABLE" if d.reapable else f"spared-by={d.spared_by or '?'}"
         lines.append(
             f"  [{d.state}] pid={d.pid} origin={d.origin or '?'} {spawner} "
             f"{scope}({scope_bit}) children={d.child_count} "
             f"rss={d.rss_kb}kB{excl}"
         )
         lines.append(f"           {d.reason}")
+        lines.append(f"           clauses {clause_bits} → {reap_bit}")
+    n_reap = len(result.reapable)
     if n_orph == 0:
         lines.append("orphans: none")
+    lines.append(
+        f"reap-predicate: {n_reap} four-clause match(es) "
+        f"(origin_or_fork AND ppid=1 AND not_live_pane AND childless_or_stale)"
+    )
     return "\n".join(lines)
 
 
@@ -573,10 +719,10 @@ def reap_orphans(
     poll_s: float = _DEFAULT_REAP_POLL_S,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> list[SignalReport]:
-    """Signal only ORPHANED daemons and their trees. LIVE/UNKNOWN untouched."""
+    """Signal only four-clause matches and their trees. T2-ORPHANED is not enough."""
     reports: list[SignalReport] = []
     seen: set[int] = set()
-    for daemon in result.orphans:
+    for daemon in result.reapable:
         for pid in reap_order(daemon.pid, proc_root=proc_root):
             if pid in seen:
                 continue
@@ -594,7 +740,7 @@ def reap_orphans(
 
 def format_reap_report(reports: list[SignalReport]) -> str:
     if not reports:
-        return "reap: none (no ORPHANED daemons — LIVE/UNKNOWN are never signalled)"
+        return "reap: none (no four-clause match — transient-only is never enough)"
     lines = [f"reap: {len(reports)} pid(s)"]
     for r in reports:
         lines.append(f"  pid={r.pid}  {r.action}  {r.reason}")
@@ -609,7 +755,7 @@ def run_orphan_daemons_report(
     reap: bool = False,
     wait_s: float = _DEFAULT_REAP_WAIT_S,
 ) -> int:
-    """Print the T1 report. With reap=True, opt-in T3 by PID after the scan."""
+    """Print the T1 report. With reap=True, opt-in four-clause kill after the scan."""
     result = scan_orphan_daemons(
         proc_root=proc_root, caller_pid=caller_pid, run=run,
     )
@@ -619,4 +765,56 @@ def run_orphan_daemons_report(
     reports = reap_orphans(result, proc_root=proc_root, wait_s=wait_s)
     print(format_reap_report(reports))
     return 0
+
+
+def run_can_fail_healthy_pane() -> int:
+    """#123 can-fail: a transient daemon that IS a live pane_pid must be spared.
+
+    Builds a fake /proc + tmux so the live box is not touched. Prints the
+    clause that spared it. Exit 0 only when that clause is not_live_pane.
+    """
+    import tempfile
+    from types import SimpleNamespace
+
+    tmp = Path(tempfile.mkdtemp(prefix="swarph-666-canfail-"))
+    try:
+        d = tmp / "42"
+        d.mkdir(parents=True)
+        cmd = (
+            "/home/u/.local/bin/claude daemon run --origin transient "
+            '--spawned-by {"label":"claude","pid":700337}'
+        )
+        (d / "cmdline").write_bytes(cmd.replace(" ", "\x00").encode() + b"\x00")
+        (d / "stat").write_text("42 (claude) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n")
+        (d / "status").write_text("Name:\tclaude\nPPid:\t1\nVmRSS:\t168000 kB\n")
+        (d / "cgroup").write_text("0::/user.slice/tmux-spawn-alive.scope\n")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["tmux", "list-sessions"]:
+                return SimpleNamespace(returncode=0, stdout="lab-ovh\n", stderr="")
+            if cmd[:2] == ["tmux", "list-panes"]:
+                return SimpleNamespace(returncode=0, stdout="42\n", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        result = scan_orphan_daemons(
+            proc_root=tmp, caller_pid=99999, run=fake_run,
+        )
+        print(format_report(result))
+        print(format_reap_report(reap_orphans(result, proc_root=tmp, kill=lambda *_: None)))
+        if len(result.daemons) != 1:
+            print("can-fail: FAIL expected 1 daemon", file=sys.stderr)
+            return 1
+        row = result.daemons[0]
+        if row.reapable or row.spared_by != CLAUSE_PANE:
+            print(
+                f"can-fail: FAIL expected spared-by={CLAUSE_PANE} "
+                f"got reapable={row.reapable} spared-by={row.spared_by}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"can-fail: PASS spared-by={row.spared_by} (healthy pane daemon not killed)")
+        return 0
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
 
